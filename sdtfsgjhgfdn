@@ -1,0 +1,267 @@
+--// Shoot Murderer with Prediction (Standalone)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local predX, predY, predZ = 0, 0, 0
+local shootOffset = 2.8
+
+local function findMurderer()
+	for _, i in ipairs(Players:GetPlayers()) do
+		if i.Backpack:FindFirstChild("Knife") then return i end
+	end
+	for _, i in ipairs(Players:GetPlayers()) do
+		if not i.Character then continue end
+		if i.Character:FindFirstChild("Knife") then return i end
+	end
+	return nil
+end
+
+local function findSheriff()
+	for _, i in ipairs(Players:GetPlayers()) do
+		if i.Backpack:FindFirstChild("Gun") then return i end
+	end
+	for _, i in ipairs(Players:GetPlayers()) do
+		if not i.Character then continue end
+		if i.Character:FindFirstChild("Gun") then return i end
+	end
+	return nil
+end
+
+local function findNearestPlayer()
+	local nearestPlayer = nil
+	local shortestDistance = math.huge
+	for _, playerIter in ipairs(Players:GetPlayers()) do
+		if playerIter ~= player and playerIter.Character then
+			local localRootPart = player.Character:FindFirstChild("HumanoidRootPart")
+			local otherRootPart = playerIter.Character:FindFirstChild("HumanoidRootPart")
+			if localRootPart and otherRootPart then
+				local distance = (localRootPart.Position - otherRootPart.Position).Magnitude
+				if distance < shortestDistance then
+					shortestDistance = distance
+					nearestPlayer = playerIter
+				end
+			end
+		end
+	end
+	return nearestPlayer
+end
+
+local function getPredictedPosition(target)
+	local targetChar = target.Character
+	if not targetChar then return Vector3.new(0,0,0) end
+
+	local playerHRP = targetChar:FindFirstChild("HumanoidRootPart")
+	local humanoid = targetChar:FindFirstChild("Humanoid")
+	if not playerHRP or not humanoid then return Vector3.new(0,0,0) end
+
+	local pos = playerHRP.Position
+	local velocity = playerHRP.AssemblyLinearVelocity
+	local moveDirection = humanoid.MoveDirection
+
+	local ping = 0.1
+	local timeStep = (shootOffset / 15) + ping
+
+	local predictedPosition = pos + (velocity * timeStep) + (moveDirection * shootOffset)
+
+	if velocity.Y > 1 then
+		predictedPosition = predictedPosition + Vector3.new(0, velocity.Y * timeStep * 1.2, 0)
+	elseif velocity.Y < -1 then
+		predictedPosition = predictedPosition + Vector3.new(0, velocity.Y * timeStep, 0)
+	end
+
+	predictedPosition = predictedPosition + Vector3.new(predX, predY, predZ)
+
+	return predictedPosition
+end
+
+-- GUI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ShootMurdererGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 160, 0, 68)
+mainFrame.Position = UDim2.new(0.5, 110, 0.5, -34)
+mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.Parent = mainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(45, 45, 45)
+mainStroke.Thickness = 1
+mainStroke.Parent = mainFrame
+
+-- Shoot Button
+local shootButton = Instance.new("TextButton")
+shootButton.Name = "ShootButton"
+shootButton.Size = UDim2.new(1, -8, 0, 28)
+shootButton.Position = UDim2.new(0, 4, 0, 4)
+shootButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+shootButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+shootButton.Text = "SHOOT MURDERER"
+shootButton.Font = Enum.Font.SourceSansBold
+shootButton.TextSize = 12
+shootButton.AutoButtonColor = false
+shootButton.Parent = mainFrame
+
+local shootCorner = Instance.new("UICorner")
+shootCorner.CornerRadius = UDim.new(0, 6)
+shootCorner.Parent = shootButton
+
+-- XYZ Input Frame
+local xyzFrame = Instance.new("Frame")
+xyzFrame.Name = "XYZPredictFrame"
+xyzFrame.Size = UDim2.new(1, -8, 0, 28)
+xyzFrame.Position = UDim2.new(0, 4, 0, 36)
+xyzFrame.BackgroundTransparency = 1
+xyzFrame.Parent = mainFrame
+
+local function createSmallInput(name, placeholder, pos)
+	local box = Instance.new("TextBox")
+	box.Name = name
+	box.Size = UDim2.new(0.3, -3, 1, 0)
+	box.Position = pos
+	box.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	box.TextColor3 = Color3.fromRGB(255, 255, 255)
+	box.PlaceholderText = placeholder
+	box.Text = "0"
+	box.Font = Enum.Font.SourceSansBold
+	box.TextSize = 11
+	box.Parent = xyzFrame
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = box
+
+	return box
+end
+
+local inputX = createSmallInput("InputX", "X", UDim2.new(0, 0, 0, 0))
+local inputY = createSmallInput("InputY", "Y", UDim2.new(0.33, 0, 0, 0))
+local inputZ = createSmallInput("InputZ", "Z", UDim2.new(0.66, 0, 0, 0))
+
+inputX.FocusLost:Connect(function() predX = tonumber(inputX.Text) or 0 end)
+inputY.FocusLost:Connect(function() predY = tonumber(inputY.Text) or 0 end)
+inputZ.FocusLost:Connect(function() predZ = tonumber(inputZ.Text) or 0 end)
+
+-- Drag + защита от случайного нажатия
+local dragging = false
+local dragStart = nil
+local startPos = nil
+local hasDragged = false
+local dragInputObject = nil
+local DRAG_THRESHOLD = 6
+
+local function startDrag(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		hasDragged = false
+		dragStart = input.Position
+		dragInputObject = input
+		startPos = mainFrame.Position
+
+		local connection
+		connection = input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+				dragInputObject = nil
+				connection:Disconnect()
+			end
+		end)
+	end
+end
+
+mainFrame.InputBegan:Connect(startDrag)
+shootButton.InputBegan:Connect(startDrag)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then return end
+	if input ~= dragInputObject then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+	local delta = input.Position - dragStart
+	if not hasDragged and delta.Magnitude >= DRAG_THRESHOLD then
+		hasDragged = true
+	end
+	if hasDragged then
+		mainFrame.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + delta.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+shootButton.MouseButton1Click:Connect(function()
+	if hasDragged then return end
+
+	if findSheriff() ~= player then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Error",
+			Text = "You're not sheriff/hero.",
+			Duration = 2
+		})
+		return
+	end
+
+	local murderer = findMurderer() or findNearestPlayer()
+	if not murderer then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Error",
+			Text = "No murderer (or other player) to shoot.",
+			Duration = 2
+		})
+		return
+	end
+
+	if not player.Character:FindFirstChild("Gun") then
+		local hum = player.Character:FindFirstChild("Humanoid")
+		if player.Backpack:FindFirstChild("Gun") then
+			hum:EquipTool(player.Backpack:FindFirstChild("Gun"))
+		else
+			game.StarterGui:SetCore("SendNotification", {
+				Title = "Error",
+				Text = "You don't have the gun.",
+				Duration = 2
+			})
+			return
+		end
+	end
+
+	local murdererHRP = murderer.Character:FindFirstChild("HumanoidRootPart")
+	if not murdererHRP then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Error",
+			Text = "Could not find the target's HumanoidRootPart.",
+			Duration = 2
+		})
+		return
+	end
+
+	local predictedPosition = getPredictedPosition(murderer)
+
+	local args = {
+		CFrame.new(player.Character:FindFirstChild("RightHand") and player.Character.RightHand.Position or player.Character.HumanoidRootPart.Position),
+		CFrame.new(predictedPosition)
+	}
+
+	pcall(function()
+		player.Character:WaitForChild("Gun"):WaitForChild("Shoot"):FireServer(unpack(args))
+	end)
+
+	game.StarterGui:SetCore("SendNotification", {
+		Title = "Shot Fired",
+		Text = "Bullet fired at predicted position.",
+		Duration = 1.5
+	})
+end)
