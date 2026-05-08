@@ -1,267 +1,423 @@
---// Shoot Murderer with Prediction (Standalone)
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
+-- ╔══════════════════════════════════════════════════════════════════════════╗
+-- ║        SHOOT MURDERER — COMBINED v1  (Red Dot + Wall Shoot + Predict)   ║
+-- ║  Объединённый скрипт: красная точка, прострел сквозь стены,             ║
+-- ║  физический предикт движения цели. Оффсеты удалены.                     ║
+-- ╚══════════════════════════════════════════════════════════════════════════╝
 
-local predX, predY, predZ = 0, 0, 0
-local shootOffset = 2.8
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local player           = Players.LocalPlayer
+local playerGui        = player:WaitForChild("PlayerGui")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  НАСТРОЙКИ
+-- ══════════════════════════════════════════════════════════════════════════════
+local BULLET_SPEED  = 300          -- скорость пули (studs/s)
+local RETRY_COUNT   = 2            -- количество повторных выстрелов
+local RETRY_DELAY   = 0.10         -- задержка между повторами (сек)
+local GRAVITY       = workspace.Gravity  -- ~196.2 studs/s²
+local ITERS         = 5            -- итерации уточнения tFlight
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  VELOCITY TRACKER  (кольцевой буфер позиций → взвешенная скорость)
+-- ══════════════════════════════════════════════════════════════════════════════
+local HISTORY_SIZE  = 8
+local GROUND_THRESH = 0.12         -- m/s; ниже — считаем «на земле» по Y
+
+local trackerData = {}
+
+local function getTracker(userId)
+	if not trackerData[userId] then
+		trackerData[userId] = {
+			samples    = {},
+			velSmooth  = Vector3.zero,
+			isAirborne = false,
+			jumpVelY   = 0,
+			jumpTime   = 0,
+		}
+	end
+	return trackerData[userId]
+end
+
+RunService.Heartbeat:Connect(function()
+	local now = tick()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p == player then continue end
+		local char = p.Character
+		if not char then continue end
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if not hrp then continue end
+
+		local td      = getTracker(p.UserId)
+		local samples = td.samples
+		local curPos  = hrp.Position
+
+		table.insert(samples, { t = now, pos = curPos })
+		while #samples > HISTORY_SIZE do table.remove(samples, 1) end
+
+		if #samples < 3 then continue end
+
+		-- взвешенная скорость из буфера
+		local sumVel, sumW = Vector3.zero, 0
+		for i = 2, #samples do
+			local dt = samples[i].t - samples[i-1].t
+			if dt > 1e-5 then
+				local v = (samples[i].pos - samples[i-1].pos) / dt
+				sumVel = sumVel + v * dt
+				sumW   = sumW + dt
+			end
+		end
+		if sumW > 1e-5 then
+			td.velSmooth = sumVel / sumW
+		end
+
+		-- детектор прыжка по двум последним сэмплам
+		local last2dt = samples[#samples].t - samples[#samples-1].t
+		local velYraw = 0
+		if last2dt > 1e-5 then
+			velYraw = (samples[#samples].pos.Y - samples[#samples-1].pos.Y) / last2dt
+		end
+
+		if not td.isAirborne then
+			if velYraw > 5 then
+				td.isAirborne = true
+				td.jumpVelY   = velYraw
+				td.jumpTime   = now
+			end
+		else
+			local hum     = char:FindFirstChild("Humanoid")
+			local onGround = hum and (hum.FloorMaterial ~= Enum.Material.Air)
+			if onGround or math.abs(velYraw) < GROUND_THRESH then
+				td.isAirborne = false
+				td.jumpVelY   = 0
+				td.jumpTime   = 0
+			end
+		end
+	end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  ПОИСК РОЛЕЙ
+-- ══════════════════════════════════════════════════════════════════════════════
+local function hasTool(p, name)
+	if p.Backpack:FindFirstChild(name) then return true end
+	if p.Character and p.Character:FindFirstChild(name) then return true end
+	return false
+end
 
 local function findMurderer()
-	for _, i in ipairs(Players:GetPlayers()) do
-		if i.Backpack:FindFirstChild("Knife") then return i end
-	end
-	for _, i in ipairs(Players:GetPlayers()) do
-		if not i.Character then continue end
-		if i.Character:FindFirstChild("Knife") then return i end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and hasTool(p, "Knife") then return p end
 	end
 	return nil
 end
 
 local function findSheriff()
-	for _, i in ipairs(Players:GetPlayers()) do
-		if i.Backpack:FindFirstChild("Gun") then return i end
-	end
-	for _, i in ipairs(Players:GetPlayers()) do
-		if not i.Character then continue end
-		if i.Character:FindFirstChild("Gun") then return i end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if hasTool(p, "Gun") then return p end
 	end
 	return nil
 end
 
 local function findNearestPlayer()
-	local nearestPlayer = nil
-	local shortestDistance = math.huge
-	for _, playerIter in ipairs(Players:GetPlayers()) do
-		if playerIter ~= player and playerIter.Character then
-			local localRootPart = player.Character:FindFirstChild("HumanoidRootPart")
-			local otherRootPart = playerIter.Character:FindFirstChild("HumanoidRootPart")
-			if localRootPart and otherRootPart then
-				local distance = (localRootPart.Position - otherRootPart.Position).Magnitude
-				if distance < shortestDistance then
-					shortestDistance = distance
-					nearestPlayer = playerIter
-				end
+	local nearest, best = nil, math.huge
+	local myHRP = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not myHRP then return nil end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and p.Character then
+			local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				local d = (myHRP.Position - hrp.Position).Magnitude
+				if d < best then best = d; nearest = p end
 			end
 		end
 	end
-	return nearestPlayer
+	return nearest
 end
 
-local function getPredictedPosition(target)
-	local targetChar = target.Character
-	if not targetChar then return Vector3.new(0,0,0) end
+-- ══════════════════════════════════════════════════════════════════════════════
+--  КРАСНАЯ ТОЧКА  (BillboardGui на торсе убийцы)
+-- ══════════════════════════════════════════════════════════════════════════════
+local targetDot = nil
 
-	local playerHRP = targetChar:FindFirstChild("HumanoidRootPart")
-	local humanoid = targetChar:FindFirstChild("Humanoid")
-	if not playerHRP or not humanoid then return Vector3.new(0,0,0) end
+local function createTargetDot()
+	if targetDot then targetDot:Destroy() end
 
-	local pos = playerHRP.Position
-	local velocity = playerHRP.AssemblyLinearVelocity
-	local moveDirection = humanoid.MoveDirection
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name          = "TargetDot"
+	billboard.AlwaysOnTop   = true
+	billboard.Size          = UDim2.new(0, 8, 0, 8)
+	billboard.SizeOffset    = Vector2.new(0, 0)
+	billboard.StudsOffset   = Vector3.new(0, 0, 0)
+	billboard.MaxDistance   = math.huge
+	billboard.ClipsDescendants = false
 
-	local ping = 0.1
-	local timeStep = (shootOffset / 15) + ping
-
-	local predictedPosition = pos + (velocity * timeStep) + (moveDirection * shootOffset)
-
-	if velocity.Y > 1 then
-		predictedPosition = predictedPosition + Vector3.new(0, velocity.Y * timeStep * 1.2, 0)
-	elseif velocity.Y < -1 then
-		predictedPosition = predictedPosition + Vector3.new(0, velocity.Y * timeStep, 0)
-	end
-
-	predictedPosition = predictedPosition + Vector3.new(predX, predY, predZ)
-
-	return predictedPosition
-end
-
--- GUI
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ShootMurdererGui"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 160, 0, 68)
-mainFrame.Position = UDim2.new(0.5, 110, 0.5, -34)
-mainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-mainFrame.BorderSizePixel = 0
-mainFrame.Active = true
-mainFrame.Parent = screenGui
-
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 8)
-mainCorner.Parent = mainFrame
-
-local mainStroke = Instance.new("UIStroke")
-mainStroke.Color = Color3.fromRGB(45, 45, 45)
-mainStroke.Thickness = 1
-mainStroke.Parent = mainFrame
-
--- Shoot Button
-local shootButton = Instance.new("TextButton")
-shootButton.Name = "ShootButton"
-shootButton.Size = UDim2.new(1, -8, 0, 28)
-shootButton.Position = UDim2.new(0, 4, 0, 4)
-shootButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-shootButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-shootButton.Text = "SHOOT MURDERER"
-shootButton.Font = Enum.Font.SourceSansBold
-shootButton.TextSize = 12
-shootButton.AutoButtonColor = false
-shootButton.Parent = mainFrame
-
-local shootCorner = Instance.new("UICorner")
-shootCorner.CornerRadius = UDim.new(0, 6)
-shootCorner.Parent = shootButton
-
--- XYZ Input Frame
-local xyzFrame = Instance.new("Frame")
-xyzFrame.Name = "XYZPredictFrame"
-xyzFrame.Size = UDim2.new(1, -8, 0, 28)
-xyzFrame.Position = UDim2.new(0, 4, 0, 36)
-xyzFrame.BackgroundTransparency = 1
-xyzFrame.Parent = mainFrame
-
-local function createSmallInput(name, placeholder, pos)
-	local box = Instance.new("TextBox")
-	box.Name = name
-	box.Size = UDim2.new(0.3, -3, 1, 0)
-	box.Position = pos
-	box.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-	box.TextColor3 = Color3.fromRGB(255, 255, 255)
-	box.PlaceholderText = placeholder
-	box.Text = "0"
-	box.Font = Enum.Font.SourceSansBold
-	box.TextSize = 11
-	box.Parent = xyzFrame
+	local dot = Instance.new("Frame")
+	dot.Size                = UDim2.new(1, 0, 1, 0)
+	dot.BackgroundColor3    = Color3.fromRGB(255, 0, 0)
+	dot.BorderSizePixel     = 0
+	dot.Parent              = billboard
 
 	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 6)
-	corner.Parent = box
+	corner.CornerRadius     = UDim.new(1, 0)
+	corner.Parent           = dot
 
-	return box
+	targetDot = billboard
+	return billboard
 end
 
-local inputX = createSmallInput("InputX", "X", UDim2.new(0, 0, 0, 0))
-local inputY = createSmallInput("InputY", "Y", UDim2.new(0.33, 0, 0, 0))
-local inputZ = createSmallInput("InputZ", "Z", UDim2.new(0.66, 0, 0, 0))
+RunService.RenderStepped:Connect(function()
+	local murderer = findMurderer()
+	if murderer and murderer.Character then
+		local torso = murderer.Character:FindFirstChild("Torso")
+			or murderer.Character:FindFirstChild("UpperTorso")
+		if torso then
+			if not targetDot or not targetDot.Parent then
+				createTargetDot()
+				targetDot.Parent = torso
+			elseif targetDot.Parent ~= torso then
+				targetDot.Parent = torso
+			end
+			return
+		end
+	end
+	if targetDot then
+		targetDot:Destroy()
+		targetDot = nil
+	end
+end)
 
-inputX.FocusLost:Connect(function() predX = tonumber(inputX.Text) or 0 end)
-inputY.FocusLost:Connect(function() predY = tonumber(inputY.Text) or 0 end)
-inputZ.FocusLost:Connect(function() predZ = tonumber(inputZ.Text) or 0 end)
+-- ══════════════════════════════════════════════════════════════════════════════
+--  ФИЗИЧЕСКИЙ ПРЕДИКТОР
+--  • Пуля MM2 летит по прямой (без гравитации) — мы не компенсируем падение
+--  • Цель симулируем: на земле — только горизонталь; в воздухе — парабола
+--  • 5 итераций для сходимости tFlight
+-- ══════════════════════════════════════════════════════════════════════════════
+local function getPing()
+	local ok, v = pcall(function()
+		return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return (ok and type(v) == "number") and (v / 1000) or 0.075
+end
 
--- Drag + защита от случайного нажатия
-local dragging = false
-local dragStart = nil
-local startPos = nil
-local hasDragged = false
-local dragInputObject = nil
-local DRAG_THRESHOLD = 6
+local function simulateTarget(pos, hVel, velY, isAirborne, t)
+	local newY = isAirborne
+		and (pos.Y + velY * t - 0.5 * GRAVITY * t * t)
+		or  pos.Y
+	return Vector3.new(
+		pos.X + hVel.X * t,
+		newY,
+		pos.Z + hVel.Z * t
+	)
+end
 
-local function startDrag(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		dragging = true
+local function getPredictedPosition(origin, target)
+	local char = target.Character
+	if not char then return nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	local ping = getPing()
+	local td   = getTracker(target.UserId)
+
+	-- горизонтальная скорость из трекера (fallback → AssemblyLinearVelocity)
+	local sv   = td.velSmooth
+	local hVel = (sv and sv.Magnitude > 0.05)
+		and Vector3.new(sv.X, 0, sv.Z)
+		or  (function()
+				local r = hrp.AssemblyLinearVelocity
+				return Vector3.new(r.X, 0, r.Z)
+			end)()
+
+	local pos        = hrp.Position
+	local isAirborne = td.isAirborne
+	local velY       = 0
+
+	if isAirborne and td.jumpTime > 0 then
+		local elapsed = tick() - td.jumpTime
+		velY = td.jumpVelY - GRAVITY * elapsed
+		if velY < -80 then velY = 0; isAirborne = false end
+	end
+
+	-- итерационное уточнение
+	local predicted = pos
+	for _ = 1, ITERS do
+		local dist    = (origin - predicted).Magnitude
+		local tFlight = dist / BULLET_SPEED + ping * 0.5
+		predicted = simulateTarget(pos, hVel, velY, isAirborne, tFlight)
+	end
+
+	return predicted
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  ВЫСТРЕЛ СКВОЗЬ СТЕНЫ
+--  Origin ставим вплотную к предсказанной точке цели (0.5 studs назад) —
+--  это обходит серверный рейкаст и гарантирует попадание даже через стены.
+-- ══════════════════════════════════════════════════════════════════════════════
+local function equipGun()
+	local char = player.Character
+	if not char then return false end
+	if char:FindFirstChild("Gun") then return true end
+	local gun = player.Backpack:FindFirstChild("Gun")
+	if not gun then return false end
+	local hum = char:FindFirstChild("Humanoid")
+	if hum then hum:EquipTool(gun) end
+	RunService.Heartbeat:Wait()
+	return char:FindFirstChild("Gun") ~= nil
+end
+
+local function fireAt(predictedPos)
+	local char = player.Character
+	if not char then return end
+	local hrp  = char:FindFirstChild("HumanoidRootPart")
+	local dir  = predictedPos - (hrp and hrp.Position or predictedPos)
+
+	-- origin — на 0.5 studs позади предсказанной точки (со стороны цели)
+	-- чтобы пуля не делала нулевой raycast и гарантированно не отсекалась стеной
+	local fakeSrc = (dir.Magnitude > 0.01)
+		and (predictedPos - dir.Unit * 0.5)
+		or  (predictedPos + Vector3.new(0, 0, -0.5))
+
+	pcall(function()
+		char:WaitForChild("Gun"):WaitForChild("Shoot"):FireServer(
+			CFrame.new(fakeSrc),
+			CFrame.new(predictedPos)
+		)
+	end)
+end
+
+local function shootMurderer()
+	if findSheriff() ~= player then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Ошибка", Text = "Ты не шериф/герой.", Duration = 2
+		})
+		return
+	end
+
+	local target = findMurderer() or findNearestPlayer()
+	if not target then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Ошибка", Text = "Цель не найдена.", Duration = 2
+		})
+		return
+	end
+
+	if not equipGun() then
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "Ошибка", Text = "Пистолет не найден.", Duration = 2
+		})
+		return
+	end
+
+	for i = 1, RETRY_COUNT do
+		local char = player.Character
+		if not char then break end
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if not hrp then break end
+		if not target.Character or not target.Character:FindFirstChild("HumanoidRootPart") then break end
+		local targetHum = target.Character:FindFirstChild("Humanoid")
+		if not targetHum or targetHum.Health <= 0 then break end
+
+		local predicted = getPredictedPosition(hrp.Position, target)
+		if not predicted then break end
+
+		fireAt(predicted)
+		if i < RETRY_COUNT then task.wait(RETRY_DELAY) end
+	end
+
+	game.StarterGui:SetCore("SendNotification", {
+		Title   = "Выстрел произведён",
+		Text    = string.format("Выпущено %d пуль по предсказанной позиции.", RETRY_COUNT),
+		Duration = 1.5
+	})
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  GUI
+-- ══════════════════════════════════════════════════════════════════════════════
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name          = "ShootMurdererGui"
+screenGui.ResetOnSpawn  = false
+screenGui.Parent        = playerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size            = UDim2.new(0, 220, 0, 72)
+mainFrame.Position        = UDim2.new(0.5, -110, 0.5, -36)
+mainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active          = true
+mainFrame.Parent          = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", mainFrame)
+stroke.Color     = Color3.fromRGB(55, 55, 55)
+stroke.Thickness = 1
+
+local title = Instance.new("TextLabel")
+title.Size               = UDim2.new(1, 0, 0, 22)
+title.Position           = UDim2.new(0, 0, 0, 4)
+title.BackgroundTransparency = 1
+title.Text               = "🎯  SHOOT MURDERER"
+title.TextColor3         = Color3.fromRGB(210, 210, 210)
+title.Font               = Enum.Font.SourceSansBold
+title.TextSize           = 13
+title.Parent             = mainFrame
+
+local shootButton = Instance.new("TextButton")
+shootButton.Size            = UDim2.new(1, -12, 0, 36)
+shootButton.Position        = UDim2.new(0, 6, 0, 30)
+shootButton.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+shootButton.TextColor3      = Color3.fromRGB(255, 255, 255)
+shootButton.Text            = "⚡ SHOOT"
+shootButton.Font            = Enum.Font.SourceSansBold
+shootButton.TextSize        = 16
+shootButton.AutoButtonColor = false
+shootButton.Parent          = mainFrame
+Instance.new("UICorner", shootButton).CornerRadius = UDim.new(0, 7)
+
+-- Hover
+shootButton.MouseEnter:Connect(function() shootButton.BackgroundColor3 = Color3.fromRGB(220, 45, 45) end)
+shootButton.MouseLeave:Connect(function() shootButton.BackgroundColor3 = Color3.fromRGB(180, 30, 30) end)
+
+-- ── Drag ────────────────────────────────────────────────────────────────────
+local dragging, dragStart, startPos, hasDragged = false, nil, nil, false
+local DRAG_THRESH = 6
+
+local function onInputBegan(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+	or input.UserInputType == Enum.UserInputType.Touch then
+		dragging   = true
 		hasDragged = false
-		dragStart = input.Position
-		dragInputObject = input
-		startPos = mainFrame.Position
-
-		local connection
-		connection = input.Changed:Connect(function()
+		dragStart  = input.Position
+		startPos   = mainFrame.Position
+		local conn; conn = input.Changed:Connect(function()
 			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-				dragInputObject = nil
-				connection:Disconnect()
+				dragging = false; conn:Disconnect()
 			end
 		end)
 	end
 end
 
-mainFrame.InputBegan:Connect(startDrag)
-shootButton.InputBegan:Connect(startDrag)
+mainFrame.InputBegan:Connect(onInputBegan)
+shootButton.InputBegan:Connect(onInputBegan)
 
 UserInputService.InputChanged:Connect(function(input)
 	if not dragging then return end
-	if input ~= dragInputObject then return end
-	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
-
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+	and input.UserInputType ~= Enum.UserInputType.Touch then return end
 	local delta = input.Position - dragStart
-	if not hasDragged and delta.Magnitude >= DRAG_THRESHOLD then
-		hasDragged = true
-	end
+	if not hasDragged and delta.Magnitude >= DRAG_THRESH then hasDragged = true end
 	if hasDragged then
 		mainFrame.Position = UDim2.new(
-			startPos.X.Scale,
-			startPos.X.Offset + delta.X,
-			startPos.Y.Scale,
-			startPos.Y.Offset + delta.Y
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
 		)
 	end
 end)
 
 shootButton.MouseButton1Click:Connect(function()
 	if hasDragged then return end
-
-	if findSheriff() ~= player then
-		game.StarterGui:SetCore("SendNotification", {
-			Title = "Error",
-			Text = "You're not sheriff/hero.",
-			Duration = 2
-		})
-		return
-	end
-
-	local murderer = findMurderer() or findNearestPlayer()
-	if not murderer then
-		game.StarterGui:SetCore("SendNotification", {
-			Title = "Error",
-			Text = "No murderer (or other player) to shoot.",
-			Duration = 2
-		})
-		return
-	end
-
-	if not player.Character:FindFirstChild("Gun") then
-		local hum = player.Character:FindFirstChild("Humanoid")
-		if player.Backpack:FindFirstChild("Gun") then
-			hum:EquipTool(player.Backpack:FindFirstChild("Gun"))
-		else
-			game.StarterGui:SetCore("SendNotification", {
-				Title = "Error",
-				Text = "You don't have the gun.",
-				Duration = 2
-			})
-			return
-		end
-	end
-
-	local murdererHRP = murderer.Character:FindFirstChild("HumanoidRootPart")
-	if not murdererHRP then
-		game.StarterGui:SetCore("SendNotification", {
-			Title = "Error",
-			Text = "Could not find the target's HumanoidRootPart.",
-			Duration = 2
-		})
-		return
-	end
-
-	local predictedPosition = getPredictedPosition(murderer)
-
-	local args = {
-		CFrame.new(player.Character:FindFirstChild("RightHand") and player.Character.RightHand.Position or player.Character.HumanoidRootPart.Position),
-		CFrame.new(predictedPosition)
-	}
-
-	pcall(function()
-		player.Character:WaitForChild("Gun"):WaitForChild("Shoot"):FireServer(unpack(args))
-	end)
-
-	game.StarterGui:SetCore("SendNotification", {
-		Title = "Shot Fired",
-		Text = "Bullet fired at predicted position.",
-		Duration = 1.5
-	})
+	shootMurderer()
 end)
